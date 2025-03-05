@@ -1,0 +1,684 @@
+---
+title: "Untitled"
+output: html_document
+date: "2024-11-04"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Packages
+```{r}
+library(readxl)
+library(nimble)
+library(coda)
+library(lattice)
+library(tidyverse)
+library(MCMCvis) 
+library(nlme)
+library(data.table)
+library(formattable)
+library(actuar)
+library(zoo)
+library(showtext)
+library(ggrepel)
+library(openxlsx)
+library(tidyr)
+library(ggplot2)
+library(reshape2)
+library(sysfonts)
+library(gganimate)
+library(gifski)
+library(knitr)
+library(kableExtra)
+
+```
+
+Criar a distribuição
+
+```{r}
+dZMPC <- nimbleFunction(
+  run = function(x   = integer(),   # Observed value
+                 mu  = double(0),   # Poisson mean
+                 p   = double(0),   # Zero-modification parameter
+                 log = logical(0, default = FALSE)) {
+    returnType(double())
+    
+    # Validity checks
+    if (mu < 0 | p < 0 | x < 0 |
+        (1 - exp(-mu)) <= 0 |  # avoids division by zero if mu=0
+        p > 1 / (1 - exp(-mu))) {
+      # When p is out of range for the given mu, we can return NA or -Inf
+      if (log) return(-Inf) else return(0)
+    }
+    
+    if (x == 0) {
+      # P(Y=0) = (1 - p) + p * e^{-mu}
+      val <- (1 - p) + p * exp(-mu)
+      if (log) return(log(val)) else return(val)
+    } else {
+      # P(Y=x>0) = p * Poisson(x; mu)
+      if (log) {
+        return(log(p) + dpois(x, mu, log = TRUE))
+      } else {
+        return(p * dpois(x, mu))
+      }
+    }
+  }
+)
+
+rZMPC <- nimbleFunction(
+  run = function(n = integer(),
+                 mu = double(0),
+                 p  = double(0)) {
+    returnType(integer())
+    
+    if (mu < 0 | p < 0 |
+        (1 - exp(-mu)) <= 0 |
+        p > 1 / (1 - exp(-mu)) |
+        n != 1) {
+      return(NaN)
+    }
+    
+    # Probability mass at zero
+    prob0 <- (1 - p) + p * exp(-mu)
+    
+    if (runif(1) < prob0) {
+      return(0)
+    } else {
+      # Rejection until x>0
+      maxIter <- 10000
+      for (i in 1:maxIter) {
+        x <- rpois(1, mu)
+        if (x > 0) return(x)
+      }
+      return(NaN)
+    }
+  }
+)
+
+registerDistributions(list(
+  dZMPC = list(
+    BUGSdist = "dZMPC(mu, p)",
+    discrete = TRUE,
+    range = c(0, Inf),
+    types = c("value = integer()", "mu = double(0)", "p = double(0)")
+  )
+))
+
+
+```
+
+Dados
+
+```{r}
+data <- read_excel("Liga Italiana 22-23.xlsx")
+
+ngames <- dim(data)[1]
+
+list_teams <- sort(unique(c(data$HomeTeam, data$AwayTeam)))
+
+nteams <- length(list_teams)
+
+games_per_round = nteams/2
+
+data <- data %>%
+  dplyr::mutate(Round = ceiling(row_number() / games_per_round))
+
+data <- data %>%
+  select(Round, everything())
+
+total_rounds <- ngames / (nteams / 2)
+
+data <- data %>%
+  mutate(
+    Result = case_when(
+      ObsHGoals > ObsAGoals ~ "HomeWin",
+      ObsHGoals < ObsAGoals ~ "AwayWin",
+      TRUE ~ "Draw"
+    )
+  )
+
+```
+
+Criar o modelo
+
+```{r}
+model <- nimbleCode({
+
+  # Likelihood for each game
+  for (g in 1:ngames) {
+    # Zero-Modified Poisson
+    y1[g] ~ dZMPC(mu = mu1[g], p = p1[hometeam[g]])
+    y2[g] ~ dZMPC(mu = mu2[g], p = p2[awayteam[g]])  
+    
+    # Linear predictors
+    log(mu1[g]) <- home + att[hometeam[g]] + def[awayteam[g]]
+    log(mu2[g]) <- att[awayteam[g]] + def[hometeam[g]] 
+  }
+
+  # (UPDATED) Priors for p1[j] and p2[j]: now simple U(0,1)
+  # Let the likelihood enforce the valid range.
+  for (j in 1:nteams) {
+    p1[j] ~ dunif(0, 3)
+    p2[j] ~ dunif(0, 3)
+  }
+  
+  # Attack & defense levels
+  for (t in 1:nteams) {
+    att.star[t] ~ dnorm(mu.att, tau.att)
+    def.star[t] ~ dnorm(mu.def, tau.def)
+    
+    # Centering constraints
+    att[t] <- att.star[t] - mean(att.star[1:nteams])
+    def[t] <- def.star[t] - mean(def.star[1:nteams])
+  }
+
+  # Global priors
+  home   ~ dnorm(0, 0.0001)
+  mu.att ~ dnorm(0, 0.001)
+  mu.def ~ dnorm(0, 0.001)
+  tau.att ~ dgamma(0.01, 0.01)
+  tau.def ~ dgamma(0.01, 0.01)
+})
+
+
+```
+
+MCMC
+
+```{r}
+team_indices <- setNames(seq_along(list_teams), list_teams)
+data$HTeamIdx <- team_indices[data$HomeTeam]
+data$ATeamIdx <- team_indices[data$AwayTeam]
+mon <- c("mu1", "mu2", "att", "def", "home", "p1", "p2")
+
+mcmc_round_results <- vector("list", length = (total_rounds / 2))
+
+mcmc_round_results <- readRDS("Código ZMPC 3 chains - LigaIta22-23_80k35k10.rds")
+
+```
+
+MCMC
+
+```{r eval=FALSE, include=FALSE}
+# Iterate through each round to generate predictions
+for (specific_round in ((total_rounds/2)+1):total_rounds) {
+  # Set up data for the specific round
+  last_game <- (specific_round - 1) * (nteams / 2)
+  round_data <- data[1:last_game, ]
+  ngames_spc_round <- nrow(round_data)
+  
+  # Set up model data and constants
+  model_data <- list(
+    y1 = round_data$ObsHGoals,
+    y2 = round_data$ObsAGoals
+  )
+  
+  const <- list(
+    hometeam = round_data$HTeamIdx, 
+    awayteam = round_data$ATeamIdx,
+    ngames = ngames_spc_round, 
+    nteams = nteams
+  )
+  
+  # Initial values for the MCMC
+  inits <- list(
+  list(
+    home = 0, mu.att = 0, mu.def = 0, 
+    tau.att = 1, tau.def = 1,
+    mu1 = rep(0.5, ngames_spc_round),  
+    mu2 = rep(0.3, ngames_spc_round),   
+    p1 = rep(0.12, nteams), 
+    p2 = rep(0.3, nteams), 
+    att.star = rep(1, nteams), 
+    def.star = rep(1, nteams)
+  ),
+  list(
+    home = 0.05, mu.att = -0.05, mu.def = 0.05, 
+    tau.att = 1.05, tau.def = 0.95,
+    mu1 = rep(0.52, ngames_spc_round),  
+    mu2 = rep(0.28, ngames_spc_round),   
+    p1 = rep(0.13, nteams), 
+    p2 = rep(0.29, nteams), 
+    att.star = rep(1.02, nteams), 
+    def.star = rep(0.98, nteams)
+  ),
+  list(
+    home = -0.05, mu.att = 0.05, mu.def = -0.05, 
+    tau.att = 0.95, tau.def = 1.05,
+    mu1 = rep(0.48, ngames_spc_round),  
+    mu2 = rep(0.32, ngames_spc_round),   
+    p1 = rep(0.11, nteams), 
+    p2 = rep(0.31, nteams), 
+    att.star = rep(0.98, nteams), 
+    def.star = rep(1.02, nteams)
+  )
+)
+  
+  # Define and compile the nimble model
+  nimble_model <- nimbleModel(code = model, data = model_data, 
+                              constants = const, inits = inits)
+  
+  mcmc_conf <- configureMCMC(nimble_model, monitors = mon, enableWAIC = TRUE)
+  
+  mcmc <- buildMCMC(mcmc_conf)
+  
+  compiled_model <- compileNimble(nimble_model)
+  compiled_mcmc <- compileNimble(mcmc, project = compiled_model)
+  
+  # Run MCMC and extract posterior samples
+  mcmcout <- runMCMC(compiled_mcmc, niter = 15000, nburnin = 7000, 
+                     thin = 4, nchains = 3, samplesAsCodaMCMC = TRUE,
+                     WAIC = TRUE)
+  
+  # Also store in a list for easy access within the R session
+  mcmc_round_results[[specific_round-(total_rounds/2)]] <- mcmcout
+}
+```
+
+
+Previsões e Criação de nsim tabelas
+
+```{r}
+nsim <- 1000
+
+# Initialize vector to store the percentages of correct predictions
+correct_percentages <- numeric(nsim)
+
+# Create a list to store standings for each simulation
+simulated_standings <- vector("list", nsim)
+all_simed_predictions <- vector("list", nsim)
+
+# Run the simulation nsim times
+for (sim in 1:nsim) {
+  if (sim %% 100 == 0) cat("Running simulation:", sim, "out of", nsim, "\n")
+  predictions <- data.frame()  # Initialize empty data frame for each simulation
+  
+  for (round_number in nteams:total_rounds) {
+    round_mcmc <- mcmc_round_results[[round_number - (total_rounds / 2)]]
+    all_samples_round <- as.matrix(round_mcmc$samples)
+    start_row <- (ngames / 2 + 1) + (round_number - nteams) * games_per_round
+    end_row <- (ngames / 2 + games_per_round) + (round_number - nteams) * games_per_round
+    indices <- start_row:end_row
+    r_index <- data[indices, c("HomeTeam", "AwayTeam", "HTeamIdx", "ATeamIdx", "ObsHGoals", "ObsAGoals")]
+    
+    # Perform simulations and calculate probabilities
+    preds <- apply(r_index, 1, function(row) {
+      h_team <- as.integer(row["HTeamIdx"])
+      a_team <- as.integer(row["ATeamIdx"])
+      
+      num_simulations <- 1000
+      num_goal_sim <- 1000
+      
+      samp_idx <- sample(1:nrow(all_samples_round), size = num_simulations, replace = TRUE)
+      sampled_home <- all_samples_round[samp_idx, "home"]
+      sampled_att_h <- all_samples_round[samp_idx, sprintf("att[%d]", h_team)]
+      sampled_def_a <- all_samples_round[samp_idx, sprintf("def[%d]", a_team)]
+      sampled_att_a <- all_samples_round[samp_idx, sprintf("att[%d]", a_team)]
+      sampled_def_h <- all_samples_round[samp_idx, sprintf("def[%d]", h_team)]
+      sampled_p1 <- all_samples_round[samp_idx, sprintf("p1[%d]", h_team)]
+      sampled_p2 <- all_samples_round[samp_idx, sprintf("p2[%d]", a_team)]
+      
+      mu1 <- exp(sampled_home + sampled_att_h + sampled_def_a)
+      mu2 <- exp(sampled_att_a + sampled_def_h)
+      
+      # Pre-allocate result vectors
+      h_goal_new <- integer(num_goal_sim)
+      a_goal_new <- integer(num_goal_sim)
+      
+      # Loop over num_simulations to generate goals
+      for (i in seq_len(num_goal_sim)) {
+        h_goal_new[i] <- rZMPC(1, mu = mu1[i], p = sampled_p1[i])
+        a_goal_new[i] <- rZMPC(1, mu = mu2[i], p = sampled_p2[i])
+      }
+      
+      c(HWin = mean(h_goal_new > a_goal_new, na.rm = TRUE),
+        Draw = mean(h_goal_new == a_goal_new, na.rm = TRUE),
+        AWin = mean(h_goal_new < a_goal_new, na.rm = TRUE),
+        MeanHGoals = mean(h_goal_new, na.rm = TRUE),
+        MeanAGoals = mean(a_goal_new, na.rm = TRUE),
+        Prop0_H = mean(h_goal_new == 0, na.rm = TRUE),
+        Prop0_A = mean(a_goal_new == 0, na.rm = TRUE))
+
+    })
+    
+    # Combine results
+    round_results <- data.frame(
+      Round = round_number,
+      r_index[, c("HomeTeam", "AwayTeam")],
+      t(preds),
+      PredictedResult = ifelse(abs(preds["HWin", ] - preds["AWin", ]) < 0.03, 
+                               "Draw",
+                               ifelse((preds["HWin", ] > preds["AWin", ] & 
+                                         preds["HWin", ] - preds["Draw", ] >= 0.02), 
+                                      "Home Win",
+                                      ifelse((preds["AWin", ] > preds["HWin", ] & 
+                                                preds["AWin", ] - preds["Draw", ] >= 0.02), 
+                                             "Away Win", "Draw"))),
+      ActualResult = ifelse(r_index$ObsHGoals > r_index$ObsAGoals, "Home Win",
+                            ifelse(r_index$ObsHGoals == r_index$ObsAGoals, "Draw", "Away Win"))
+    )
+    
+    predictions <- rbind(predictions, round_results)  # Append results
+  }
+  
+  # Calculate percentage of correct predictions for this simulation
+  correct_percentages[sim] <- mean(predictions$PredictedResult == predictions$ActualResult) * 100
+  
+  # Create standings table
+  standings <- data.frame(
+    Team = list_teams,
+    Points = 0,
+    Wins = 0,
+    Draws = 0,
+    Losses = 0
+  )
+  
+  for (team in list_teams) {
+    home_matches <- predictions[predictions$HomeTeam == team, ]
+    away_matches <- predictions[predictions$AwayTeam == team, ]
+    
+    # Wins, Draws, Losses
+    standings[standings$Team == team, "Wins"] <- sum(home_matches$PredictedResult == "Home Win") + 
+                                                 sum(away_matches$PredictedResult == "Away Win")
+    standings[standings$Team == team, "Draws"] <- sum(home_matches$PredictedResult == "Draw") + 
+                                                  sum(away_matches$PredictedResult == "Draw")
+    standings[standings$Team == team, "Losses"] <- sum(home_matches$PredictedResult == "Away Win") + 
+                                                   sum(away_matches$PredictedResult == "Home Win")
+    
+    # Points
+    standings[standings$Team == team, "Points"] <- standings[standings$Team == team, "Wins"] * 3 +
+                                                   standings[standings$Team == team, "Draws"] * 1
+  }
+  
+  # Rank teams by points
+  standings <- standings[order(-standings$Points, standings$Team), ]
+  standings$Ranking <- seq_len(nrow(standings))
+  standings <- standings[, c("Ranking", "Team", "Points", "Wins", "Draws", "Losses")]
+  
+  simulated_standings[[sim]] <- standings
+  all_simed_predictions[[sim]] <- predictions
+}
+
+# Calculate and display the average percentage of correct predictions
+average_correct_percentage <- mean(correct_percentages)
+cat("Average Percentage of Correct Predictions over", nsim, "simulations:",
+    round(average_correct_percentage, 2), "%\n")
+
+
+```
+
+Juntar as tabelas criadas numa única tabela
+
+```{r}
+# Initialize variables
+num_teams <- length(unique(unlist(lapply(simulated_standings, function(x) x$Team))))
+
+# Initialize the final summary table with zero values
+summary_table <- data.frame(Team = list_teams, matrix(0, nrow = num_teams, ncol = num_teams))
+colnames(summary_table)[-1] <- as.character(1:num_teams)  # Set columns as "1", "2", ..., up to "num_teams"
+
+# Iterate over each simulation to update rankings
+for (sim in simulated_standings) {
+  for (team in list_teams) {
+    # Find the ranking for the current team in this simulation
+    team_ranking <- sim$Ranking[sim$Team == team]
+    
+    # Update the corresponding cell in the summary table
+    summary_table[summary_table$Team == team, as.character(team_ranking)] <- 
+      summary_table[summary_table$Team == team, as.character(team_ranking)] + 1
+  }
+}
+
+# Convert counts to proportions by dividing by the total number of simulations and rounding to 3 decimal places
+summary_table[-1] <- round(summary_table[-1] / length(simulated_standings), 3)
+
+```
+
+Combinar as 3 chains
+
+```{r}
+# Step 1: Extract the 'samples' from mcmc_round_results
+samples_list <- lapply(mcmc_round_results, function(x) x[["samples"]])
+
+# Step 2: Combine chains for each round
+combined_samples_list <- lapply(samples_list, function(samples) {
+  do.call(rbind, samples)  # Combine chain1, chain2, and chain3
+})
+
+```
+
+Tabelas
+
+```{r}
+# Step 1: Function to Calculate Observed Standings
+calculate_observed_standings <- function(data_subset) {
+  # Initialize the standings table
+  standings <- data.frame(
+    Team = unique(c(data_subset$HomeTeam, data_subset$AwayTeam)),
+    Points = 0, Wins = 0, Draws = 0, Losses = 0,
+    stringsAsFactors = FALSE
+  )
+  
+  # Iterate over each team to calculate standings
+  for (team in standings$Team) {
+    # Count wins, draws, and losses for home and away games
+    home_wins <- sum(data_subset$HomeTeam == team & data_subset$Result == "HomeWin")
+    away_wins <- sum(data_subset$AwayTeam == team & data_subset$Result == "AwayWin")
+    draws_as_home <- sum(data_subset$HomeTeam == team & data_subset$Result == "Draw")
+    draws_as_away <- sum(data_subset$AwayTeam == team & data_subset$Result == "Draw")
+    total_games_played <- sum(data_subset$HomeTeam == team | data_subset$AwayTeam == team)
+    
+    # Update the standings
+    standings[standings$Team == team, ] <- data.frame(
+      Team = team,
+      Points = (home_wins + away_wins) * 3 + (draws_as_home + draws_as_away),
+      Wins = home_wins + away_wins,
+      Draws = draws_as_home + draws_as_away,
+      Losses = total_games_played - (home_wins + away_wins + draws_as_home + draws_as_away)
+    )
+  }
+  
+  # Order teams by points
+  standings <- standings[order(-standings$Points), ]
+  return(standings)
+}
+
+# Step 2: Observed Standings for Different Parts of the Season
+# Full observed standings for the entire season
+full_observed_standings <- calculate_observed_standings(data)
+
+# Observed standings for the first half of the season
+observed_data_1_half <- data %>% filter(Round <= nteams - 1)
+observed_standings_1_half <- calculate_observed_standings(observed_data_1_half)
+
+# Observed standings for the second half of the season
+observed_data_2_half <- data %>% filter(Round > nteams - 1)
+observed_standings_2_half <- calculate_observed_standings(observed_data_2_half)
+
+# Step 3: Combine Observed and Simulated Standings
+full_season_standings <- vector("list", nsim)
+
+for (sim in 1:nsim) {
+  # Get simulated standings for the second half
+  simulated_half <- simulated_standings[[sim]]
+  
+  # Merge observed and simulated standings by team
+  full_standing <- dplyr::left_join(
+    observed_standings_1_half, simulated_half, by = "Team", suffix = c("_obs", "_pred")
+  ) %>%
+    # Calculate full season standings
+    dplyr::mutate(
+      Total_Points = Points_obs + Points_pred,
+      Total_Wins = Wins_obs + Wins_pred,
+      Total_Draws = Draws_obs + Draws_pred,
+      Total_Losses = Losses_obs + Losses_pred
+    ) %>%
+    # Rank teams by total points
+    dplyr::arrange(desc(Total_Points)) %>%
+    dplyr::mutate(Ranking = row_number()) %>%
+    dplyr::select(Team, Total_Points, Total_Wins, Total_Draws, Total_Losses, Ranking)
+  
+  # Store the standings
+  full_season_standings[[sim]] <- full_standing
+}
+
+# Step 4: Generate the Final Summary Table
+team_names <- unique(full_season_standings[[1]]$Team)
+num_teams <- length(team_names)
+
+# Initialize summary table
+final_summary_table <- data.frame(
+  Team = team_names,
+  matrix(0, nrow = num_teams, ncol = num_teams)
+)
+colnames(final_summary_table)[-1] <- as.character(1:num_teams)
+
+# Count rankings across simulations
+for (sim in full_season_standings) {
+  for (team in team_names) {
+    team_ranking <- sim$Ranking[sim$Team == team]
+    final_summary_table[final_summary_table$Team == team, as.character(team_ranking)] <- 
+      final_summary_table[final_summary_table$Team == team, as.character(team_ranking)] + 1
+  }
+}
+
+# Convert counts to proportions
+final_summary_table[-1] <- round(final_summary_table[-1] / length(full_season_standings), 3)
+
+# Calculate Mean Classification and Standard Deviation
+mean_classification <- apply(final_summary_table[-1], 1, function(row) {
+  sum(as.numeric(colnames(final_summary_table)[-1]) * row)
+})
+
+standard_deviation <- apply(final_summary_table[-1], 1, function(row) {
+  sqrt(sum(((as.numeric(colnames(final_summary_table)[-1]) - mean_classification)^2) * row))
+})
+
+# Add mean and standard deviation to the summary table
+final_summary_table <- cbind(
+  final_summary_table["Team"], 
+  Mean_Classification = round(mean_classification, 3), 
+  Standard_Deviation = round(standard_deviation, 3), 
+  final_summary_table[-1]
+)
+
+```
+
+Proporção de zeros
+
+```{r}
+# Calculate the number of scoreless matches and combine into one data frame
+scoreless_summary_2 <- full_join(
+  # Scoreless at home
+  observed_data_2_half %>%
+    filter(ObsHGoals == 0) %>%
+    count(HomeTeam, name = "HomeScoreless"),
+  # Scoreless away
+  observed_data_2_half %>%
+    filter(ObsAGoals == 0) %>%
+    count(AwayTeam, name = "AwayScoreless"),
+  by = c("HomeTeam" = "AwayTeam")
+) %>%
+  # Rename the common team column and replace missing counts with 0
+  rename(Team = HomeTeam) %>%
+  mutate(
+    HomeScoreless = replace_na(HomeScoreless, 0),
+    AwayScoreless = replace_na(AwayScoreless, 0)
+  ) %>%
+  # Calculate total scoreless matches
+  mutate(TotalScoreless = HomeScoreless + AwayScoreless) %>%
+  # Since each team plays exactly (nteams - 1) matches in the second half:
+  mutate(
+    TotalMatches = nteams - 1,
+    ProportionScoreless = TotalScoreless / TotalMatches
+  ) %>%
+  arrange(desc(ProportionScoreless))
+#########################################################################
+# Step 1: Extract the ordering from the first simulation
+# Assume that all_simed_predictions[[1]] has the desired row order.
+ordering <- all_simed_predictions[[1]] %>%
+  mutate(RowOrder = row_number()) %>%
+  select(Round, HomeTeam, AwayTeam, RowOrder)
+
+# Step 2: Combine all simulation predictions into one data frame
+combined_preds <- do.call(rbind, all_simed_predictions)
+
+# Step 3: Group by match identifiers and compute mean predicted proportions
+mean_zero_proportions <- combined_preds %>%
+  group_by(Round, HomeTeam, AwayTeam) %>%
+  summarise(
+    MeanProp0_H = mean(Prop0_H, na.rm = TRUE),
+    MeanProp0_A = mean(Prop0_A, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# Step 4: Reorder the results using the ordering extracted from the first simulation
+mean_zero_proportions_ordered <- mean_zero_proportions %>%
+  inner_join(ordering, by = c("Round", "HomeTeam", "AwayTeam")) %>%
+  arrange(RowOrder) %>%
+  select(Round, HomeTeam, AwayTeam, MeanProp0_H, MeanProp0_A)
+###############################################################################
+
+# ------------------------------
+# Step 1: Aggregate for Home Matches
+# ------------------------------
+home_summary <- mean_zero_proportions_ordered %>%
+  group_by(Team = HomeTeam) %>%
+  summarise(
+    MeanHomeZero = mean(MeanProp0_H, na.rm = TRUE),
+    NumHomeMatches = n()
+  )
+
+# ------------------------------
+# Step 2: Aggregate for Away Matches
+# ------------------------------
+away_summary <- mean_zero_proportions_ordered %>%
+  group_by(Team = AwayTeam) %>%
+  summarise(
+    MeanAwayZero = mean(MeanProp0_A, na.rm = TRUE),
+    NumAwayMatches = n()
+  )
+
+# ------------------------------
+# Step 3: Combine Home and Away Summaries
+# ------------------------------
+team_mean_zeros_ZMPC <- full_join(home_summary, away_summary, by = "Team") %>%
+  # Replace missing values with 0 if a team appears only in home or away matches
+  mutate(
+    MeanHomeZero = ifelse(is.na(MeanHomeZero), 0, MeanHomeZero),
+    MeanAwayZero = ifelse(is.na(MeanAwayZero), 0, MeanAwayZero),
+    NumHomeMatches = ifelse(is.na(NumHomeMatches), 0, NumHomeMatches),
+    NumAwayMatches = ifelse(is.na(NumAwayMatches), 0, NumAwayMatches)
+  ) %>%
+  # Compute total matches played by the team in the second half
+  mutate(TotalMatches = NumHomeMatches + NumAwayMatches) %>%
+  # Compute an overall weighted average of the zero proportions (if home and away differ)
+  mutate(OverallMeanZero = (MeanHomeZero * NumHomeMatches + MeanAwayZero * NumAwayMatches) / TotalMatches) %>%
+  # New column: Predicted number of zeros (OverallMeanZero * TotalMatches)
+  mutate(PredictedZeros = OverallMeanZero * TotalMatches)
+##########################################################################
+# Create a comparison data frame by merging observed and predicted data
+comparison_df <- scoreless_summary_2 %>%
+  select(Team, ObservedZeros = TotalScoreless) %>% 
+  inner_join(team_mean_zeros_ZMPC %>% select(Team, PredictedZeros), by = "Team") %>%
+  arrange(ObservedZeros)  # Order by ObservedZeros in ascending order
+
+# Set the factor levels of Team in the desired order
+comparison_df$Team <- factor(comparison_df$Team, levels = comparison_df$Team)
+
+
+```
+
+```{r}
+#saveRDS(mcmc_round_results, file = "zmpco1_ita_15k7k4_priorp.rds")
+
+```
+
+```{r}
+#mcmc_round_results <- readRDS("Código ZMP 3 chains - LigaPor_80k35k10.rds")
+```
+
